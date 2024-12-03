@@ -31,74 +31,76 @@ app.use(express.urlencoded({ extended: true }));
 app.use(express.json()); // Add JSON parsing middleware
 
 app.post('/payment-success', async (req, res) => {
-  try {
-    const { transactionId } = req.query;
-    
-    // Log incoming request details for debugging
-    console.log('Transaction ID:', transactionId);
-    console.log('Request Query:', req.query);
-    console.log('Request Body:', req.body);
-
-
-    // Validate required parameters
-    if (!transactionId) {
-      return res.status(400).send('Missing transaction ID');
-    }
-
-   
-
-    if (true) {
-      // Get the transaction from Firestore
-      const transactionRef = admin.firestore().collection('transactions').where('txnid', '==', transactionId);
-      const transactionSnapshot = await transactionRef.get();
-
-      if (transactionSnapshot.empty) {
-        return res.status(404).send('Transaction not found');
+    try {
+      const { transactionId } = req.query;
+      
+      // Validate required parameters
+      if (!transactionId) {
+        return res.status(400).send('Missing transaction ID');
       }
-
-      // There should only be one transaction with this ID
-      const transactionDoc = transactionSnapshot.docs[0];
-      const transactionData = transactionDoc.data();
-
-      // Create the final order
-      const orderData = {
-        ...transactionData,
-        status: 'pending',
-        paymentStatus: 'completed',
-        paymentDetails: req.body,
-        confirmedAt: admin.firestore.FieldValue.serverTimestamp()
-      };
-
-      // Save the order
-      await admin.firestore().collection('orders').add(orderData);
-
-      // Update the transaction status
-      await transactionDoc.ref.update({
-        status: 'completed',
-        paymentStatus: 'success'
+      
+      // Use a transaction to ensure atomic operation
+      const firestore = admin.firestore();
+      const orderCollection = firestore.collection('orders');
+      const transactionCollection = firestore.collection('transactions');
+ 
+      // Perform a firestore transaction
+      await firestore.runTransaction(async (transaction) => {
+        // Find the transaction
+        const transactionQuery = transactionCollection.where('txnid', '==', transactionId);
+        const transactionSnapshot = await transaction.get(transactionQuery);
+        
+        if (transactionSnapshot.empty) {
+          throw new Error('Transaction not found');
+        }
+        
+        // Check if an order already exists for this transaction
+        const existingOrderQuery = orderCollection.where('txnid', '==', transactionId);
+        const existingOrderSnapshot = await transaction.get(existingOrderQuery);
+        
+        // If an order already exists, skip order creation
+        if (!existingOrderSnapshot.empty) {
+          console.log('Order already exists for this transaction');
+          return;
+        }
+        
+        // Get the transaction document
+        const transactionDoc = transactionSnapshot.docs[0];
+        const transactionData = transactionDoc.data();
+        
+        // Prepare order data
+        const orderData = {
+          ...transactionData,
+          txnid: transactionId,
+          status: 'pending',
+          paymentStatus: 'completed',
+          paymentDetails: req.body,
+          confirmedAt: admin.firestore.FieldValue.serverTimestamp()
+        };
+        
+        // Create the order
+        transaction.create(orderCollection.doc(), orderData);
+        
+        // Update transaction status
+        transaction.update(transactionDoc.ref, {
+          status: 'completed',
+          paymentStatus: 'success'
+        });
       });
-
+      
       // Redirect to success page
       res.redirect('https://www.thefost.com/');
-    } else {
-      // Payment verification failed
-      const transactionRef = admin.firestore().collection('transactions').where('txnid', '==', transactionId);
-      const transactionSnapshot = await transactionRef.get();
-
-      if (!transactionSnapshot.empty) {
-        await transactionSnapshot.docs[0].ref.update({
-          status: 'failed',
-          paymentStatus: 'failed'
-        });
+    } catch (error) {
+      console.error('Error processing payment success:', error);
+      
+      // Check if it's a duplicate order error
+      if (error.message === 'Order already exists for this transaction') {
+        return res.redirect('https://www.thefost.com/');
       }
-
-      res.redirect('https://www.thefost.com/payment-failed');
+      
+      res.status(500).send('Internal Server Error');
     }
-  } catch (error) {
-    console.error('Error processing payment success:', error);
-    res.status(500).send('Internal Server Error');
-  }
-});
+ });
 
 // Add error handling for undefined routes
 app.use((req, res) => {
