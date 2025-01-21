@@ -161,13 +161,13 @@ app.post('/payment-success', async (req, res) => {
     });
     
     // Redirect to order waiting page with the order ID
-    res.redirect(`https://main.d15io2iwu35boj.amplifyapp.com/order-waiting/${orderId}`);
+    res.redirect(`https://www.thefost.com/order-waiting/${orderId}`);
   } catch (error) {
     console.error('Error processing payment success:', error);
     
     // Check if it's a duplicate order error and we have the order ID
     if (error.message === 'Order already exists for this transaction' && orderId) {
-      return res.redirect(`https://main.d15io2iwu35boj.amplifyapp.com/order-waiting/${orderId}`);
+      return res.redirect(`https://www.thefost.com/order-waiting/${orderId}`);
     }
     
     res.status(500).send('Internal Server Error');
