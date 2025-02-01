@@ -120,6 +120,146 @@ app.post('/initiate-payment', async (req, res) => {
   }
 });
 
+// Add this new webhook endpoint to your existing server code
+app.post('/payu-webhook', async (req, res) => {
+  try {
+    const payload = req.body;
+    
+    // Verify the webhook signature
+    const PAYU_SALT_KEY = process.env.PAYU_SALT_KEY;
+    const receivedHash = payload.hash;
+    const calculatedHash = CryptoJS.SHA512(
+      `${payload.txnid}|${payload.status}|${payload.firstname}|${payload.email}|${payload.amount}|${PAYU_SALT_KEY}`
+    ).toString();
+
+    if (receivedHash !== calculatedHash) {
+      console.error('Invalid webhook signature');
+      return res.status(400).send('Invalid signature');
+    }
+
+    // Process only successful payments
+    if (payload.status === 'success') {
+      const transactionId = payload.txnid;
+      
+      // Use a transaction to ensure atomic operation
+      const firestore = admin.firestore();
+      const orderCollection = firestore.collection('orders');
+      const transactionCollection = firestore.collection('transactions');
+      let orderId;
+      let orderData;
+
+      await firestore.runTransaction(async (transaction) => {
+        // Find the transaction
+        const transactionQuery = transactionCollection.where('txnid', '==', transactionId);
+        const transactionSnapshot = await transaction.get(transactionQuery);
+        
+        if (transactionSnapshot.empty) {
+          throw new Error('Transaction not found');
+        }
+        
+        // Check if an order already exists for this transaction
+        const existingOrderQuery = orderCollection.where('txnid', '==', transactionId);
+        const existingOrderSnapshot = await transaction.get(existingOrderQuery);
+        
+        if (!existingOrderSnapshot.empty) {
+          orderId = existingOrderSnapshot.docs[0].id;
+          orderData = existingOrderSnapshot.docs[0].data();
+          console.log('Order already exists for this transaction');
+          return;
+        }
+        
+        // Get the transaction document
+        const transactionDoc = transactionSnapshot.docs[0];
+        const transactionData = transactionDoc.data();
+        
+        // Prepare order data
+        orderData = {
+          ...transactionData,
+          txnid: transactionId,
+          status: 'pending',
+          paymentStatus: 'completed',
+          paymentDetails: payload,
+          confirmedAt: admin.firestore.FieldValue.serverTimestamp()
+        };
+        
+        // Create the order
+        const newOrderRef = orderCollection.doc();
+        orderId = newOrderRef.id;
+        transaction.create(newOrderRef, orderData);
+        
+        // Update transaction status
+        transaction.update(transactionDoc.ref, {
+          status: 'completed',
+          paymentStatus: 'success'
+        });
+      });
+
+      // Send order confirmation email
+      try {
+        const formattedItems = orderData.items.map(item => 
+          `${item.name} x ${item.quantity} - ₹${(item.price * item.quantity).toFixed(2)}`
+        );
+
+        const mailOptions = {
+          from: process.env.EMAIL_USER,
+          to: orderData.customerEmail,
+          subject: `Order Confirmation - ${orderData.shopName} - Order #${orderId.slice(-6)}`,
+          html: `
+            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+              <!-- Your existing email template content -->
+              <div style="text-align: center; margin-bottom: 30px;">
+                <h1 style="color: #4A5568;">Order Confirmation</h1>
+              </div>
+              
+              <div style="background-color: #F7FAFC; padding: 20px; border-radius: 8px; margin-bottom: 20px;">
+                <p style="margin: 0;">Hi ${orderData.firstname || 'Valued Customer'},</p>
+                <p>Thank you for your order! We're pleased to confirm that your order has been received and is being processed.</p>
+              </div>
+              
+              <div style="margin-bottom: 20px;">
+                <h2 style="color: #4A5568; font-size: 18px;">Order Details:</h2>
+                <p style="margin: 5px 0;">Order Number: #${orderId.slice(-6)}</p>
+                <p style="margin: 5px 0;">Restaurant/Store: ${orderData.shopName}</p>
+                <p style="margin: 5px 0;">Payment Method: Online Payment</p>
+              </div>
+              
+              <div style="margin-bottom: 20px;">
+                <h3 style="color: #4A5568; font-size: 16px;">Items Ordered:</h3>
+                <ul style="list-style: none; padding: 0;">
+                  ${formattedItems.map(item => `
+                    <li style="padding: 10px; background-color: #F7FAFC; margin-bottom: 5px; border-radius: 4px;">
+                      ${item}
+                    </li>
+                  `).join('')}
+                </ul>
+              </div>
+              
+              <div style="background-color: #F7FAFC; padding: 15px; border-radius: 8px; margin-bottom: 20px;">
+                <p style="margin: 0; font-size: 18px; font-weight: bold;">
+                  Total Amount: ₹${orderData.total.toFixed(2)}
+                </p>
+              </div>
+            </div>
+          `
+        };
+
+        await transporter.sendMail(mailOptions);
+        console.log('Order confirmation email sent successfully');
+      } catch (emailError) {
+        console.error('Failed to send order confirmation email:', emailError);
+      }
+    }
+
+    // Always return 200 OK for webhook
+    res.status(200).send('OK');
+    
+  } catch (error) {
+    console.error('Webhook processing error:', error);
+    // Still return 200 OK to acknowledge receipt
+    res.status(200).send('OK');
+  }
+});
+
 
 app.post('/send-order-confirmation', async (req, res) => {
   try {
