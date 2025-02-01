@@ -96,7 +96,7 @@ app.post('/initiate-payment', async (req, res) => {
       firstname: userData.displayName || 'Customer',
       email: userData.email,
       phone: userData.phoneNumber || '',
-      surl: `https://fostservernew.onrender.com/payment-success?transactionId=${txnid}`,
+      surl: `https://fostservernew-1.onrender.com/payment-success?transactionId=${txnid}`,
       furl: `${process.env.FRONTEND_URL}/payment-failure`,
     };
 
@@ -343,7 +343,7 @@ app.post('/payment-success', async (req, res) => {
         `${item.name} x ${item.quantity} - ₹${(item.price * item.quantity).toFixed(2)}`
       );
 
-      await axios.post(`https://fostservernew.onrender.com/send-order-confirmation`, {
+      await axios.post(`https://fostservernew-1.onrender.com/send-order-confirmation`, {
         orderId: orderId,
         customerEmail: orderData.customerEmail,
         shopName: orderData.shopName,
