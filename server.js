@@ -160,7 +160,7 @@ app.post('/initiate-payment', async (req, res) => {
 });
 
 // PayU Webhook Handler
-app.post('/payu-webhook', verifyPayUWebhook, async (req, res) => {
+app.post('/payu-webhook', async (req, res) => {
   try {
     console.log('Received PayU webhook:', JSON.stringify(req.body, null, 2));
     const { txnid, status, amount } = req.body;
