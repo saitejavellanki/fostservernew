@@ -222,7 +222,7 @@ app.post('/payu-webhook', async (req, res) => {
 });
 
 // Payment Success Route
-app.get('/payment-success', async (req, res) => {
+app.post('/payment-success', async (req, res) => {
   try {
     const { transactionId } = req.query;
     console.log('Processing payment success for transaction:', transactionId);
