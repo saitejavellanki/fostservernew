@@ -280,7 +280,7 @@ app.post('/payment-success', async (req, res) => {
     if (!transactionId) {
       return res.status(400).send('Missing transaction ID');
     }
-    
+    console.log("creating the order .....");
     // Use a transaction to ensure atomic operation
     const firestore = admin.firestore();
     const orderCollection = firestore.collection('orders');
@@ -336,23 +336,67 @@ app.post('/payment-success', async (req, res) => {
       });
     });
 
-    // Send order confirmation email
+    console.log("Order created succesfully");
+
+    // Send order confirmation email directly using nodemailer
     try {
       // Format items for email
       const formattedItems = orderData.items.map(item => 
         `${item.name} x ${item.quantity} - ₹${(item.price * item.quantity).toFixed(2)}`
       );
 
-      await axios.post(`https://fostservernew-1.onrender.com/send-order-confirmation`, {
-        orderId: orderId,
-        customerEmail: orderData.customerEmail,
-        shopName: orderData.shopName,
-        customerName: orderData.firstname || 'Valued Customer',
-        items: formattedItems,
-        total: orderData.total,
-        paymentMethod: 'Online Payment'
-      });
+      const mailOptions = {
+        from: process.env.EMAIL_USER,
+        to: orderData.customerEmail,
+        subject: `Order Confirmation - ${orderData.shopName} - Order #${orderId.slice(-6)}`,
+        html: `
+          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+            <div style="text-align: center; margin-bottom: 30px;">
+              <h1 style="color: #4A5568;">Order Confirmation</h1>
+            </div>
+            
+            <div style="background-color: #F7FAFC; padding: 20px; border-radius: 8px; margin-bottom: 20px;">
+              <p style="margin: 0;">Hi ${orderData.firstname || 'Valued Customer'},</p>
+              <p>Thank you for your order! We're pleased to confirm that your order has been received and is being processed.</p>
+            </div>
+            
+            <div style="margin-bottom: 20px;">
+              <h2 style="color: #4A5568; font-size: 18px;">Order Details:</h2>
+              <p style="margin: 5px 0;">Order Number: #${orderId.slice(-6)}</p>
+              <p style="margin: 5px 0;">Restaurant/Store: ${orderData.shopName}</p>
+              <p style="margin: 5px 0;">Payment Method: Online Payment</p>
+            </div>
+            
+            <div style="margin-bottom: 20px;">
+              <h3 style="color: #4A5568; font-size: 16px;">Items Ordered:</h3>
+              <ul style="list-style: none; padding: 0;">
+                ${formattedItems.map(item => `
+                  <li style="padding: 10px; background-color: #F7FAFC; margin-bottom: 5px; border-radius: 4px;">
+                    ${item}
+                  </li>
+                `).join('')}
+              </ul>
+            </div>
+            
+            <div style="background-color: #F7FAFC; padding: 15px; border-radius: 8px; margin-bottom: 20px;">
+              <p style="margin: 0; font-size: 18px; font-weight: bold;">
+                Total Amount: ₹${orderData.total.toFixed(2)}
+              </p>
+            </div>
+            
+            <div style="border-top: 2px solid #E2E8F0; padding-top: 20px; margin-top: 20px;">
+              <p style="color: #4A5568; font-size: 14px;">
+                We'll notify you when your order is ready for pickup. You can track your order status on our website.
+              </p>
+              <p style="color: #4A5568; font-size: 14px;">
+                Thank you for choosing ${orderData.shopName}!
+              </p>
+            </div>
+          </div>
+        `
+      };
 
+      await transporter.sendMail(mailOptions);
       console.log('Order confirmation email sent successfully');
     } catch (emailError) {
       console.error('Failed to send order confirmation email:', emailError);
@@ -372,7 +416,6 @@ app.post('/payment-success', async (req, res) => {
     res.status(500).send('Internal Server Error');
   }
 });
-
 // Add error handling for undefined routes
 app.use((req, res) => {
   res.status(404).send('Not Found');
