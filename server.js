@@ -40,6 +40,7 @@ const transporter = nodemailer.createTransport({
 // PayU webhook verification middleware
 const verifyPayUWebhook = (req, res, next) => {
   try {
+    console.log('Verifying PayU webhook signature');
     const { hash, key, txnid, status, amount } = req.body;
     const PAYU_SALT_KEY = process.env.PAYU_SALT_KEY;
     
@@ -47,13 +48,36 @@ const verifyPayUWebhook = (req, res, next) => {
     const calculatedHash = CryptoJS.SHA512(hashString).toString();
     
     if (hash === calculatedHash) {
+      console.log('PayU webhook signature verified successfully');
       next();
     } else {
+      console.error('Invalid PayU webhook signature');
       res.status(401).json({ error: 'Invalid webhook signature' });
     }
   } catch (error) {
+    console.error('Error verifying PayU webhook:', error);
     res.status(400).json({ error: 'Invalid webhook data' });
   }
+};
+
+// Helper function to process order creation
+const createOrder = async (transactionData, paymentDetails = null, processType = 'webhook') => {
+  const firestore = admin.firestore();
+  const orderRef = firestore.collection('orders').doc();
+  
+  const orderData = {
+    ...transactionData,
+    status: 'pending',
+    paymentStatus: 'completed',
+    confirmedAt: admin.firestore.FieldValue.serverTimestamp(),
+    processType: processType,
+    ...(paymentDetails && { paymentDetails })
+  };
+
+  await orderRef.set(orderData);
+  await sendOrderConfirmationEmail(orderRef.id, orderData);
+  
+  return orderRef.id;
 };
 
 // Initiate Payment Route
@@ -93,6 +117,7 @@ app.post('/initiate-payment', async (req, res) => {
       status: 'pending',
       paymentStatus: 'pending',
       customerEmail: userData.email,
+      firstname: userData.displayName || 'Customer',
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       txnid: txnid
     };
@@ -137,48 +162,54 @@ app.post('/initiate-payment', async (req, res) => {
 // PayU Webhook Handler
 app.post('/payu-webhook', verifyPayUWebhook, async (req, res) => {
   try {
+    console.log('Received PayU webhook:', JSON.stringify(req.body, null, 2));
     const { txnid, status, amount } = req.body;
     
     const firestore = admin.firestore();
+
+    // Check for existing order to prevent duplicates
+    const existingOrderSnapshot = await firestore
+      .collection('orders')
+      .where('txnid', '==', txnid)
+      .get();
+
+    if (!existingOrderSnapshot.empty) {
+      console.log('Order already exists for transaction:', txnid);
+      return res.status(200).json({ message: 'Order already processed' });
+    }
+
+    // Process the webhook
     await firestore.runTransaction(async (transaction) => {
-      // Get transaction document
-      const transactionQuery = firestore.collection('transactions')
-        .where('txnid', '==', txnid);
-      const transactionDoc = await transaction.get(transactionQuery);
+      const transactionQuery = await transaction.get(
+        firestore.collection('transactions').where('txnid', '==', txnid)
+      );
       
-      if (transactionDoc.empty) {
+      if (transactionQuery.empty) {
         throw new Error('Transaction not found');
       }
 
-      const transactionData = transactionDoc.docs[0].data();
+      const transactionDoc = transactionQuery.docs[0];
+      const transactionData = transactionDoc.data();
       
       if (status.toLowerCase() === 'success') {
         // Create order
-        const orderData = {
-          ...transactionData,
-          status: 'pending',
-          paymentStatus: 'completed',
-          paymentDetails: req.body,
-          confirmedAt: admin.firestore.FieldValue.serverTimestamp()
-        };
-
-        const orderRef = firestore.collection('orders').doc();
-        await transaction.create(orderRef, orderData);
+        await createOrder(transactionData, req.body, 'webhook');
 
         // Update transaction
-        await transaction.update(transactionDoc.docs[0].ref, {
+        await transaction.update(transactionDoc.ref, {
           status: 'completed',
-          paymentStatus: 'success'
+          paymentStatus: 'success',
+          webhookProcessed: true,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp()
         });
-
-        // Send confirmation email
-        await sendOrderConfirmationEmail(orderRef.id, orderData);
       } else {
         // Handle failed payment
-        await transaction.update(transactionDoc.docs[0].ref, {
+        await transaction.update(transactionDoc.ref, {
           status: 'failed',
           paymentStatus: 'failed',
-          failureReason: req.body.error_Message || 'Payment failed'
+          failureReason: req.body.error_Message || 'Payment failed',
+          webhookProcessed: true,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp()
         });
       }
     });
@@ -191,12 +222,14 @@ app.post('/payu-webhook', verifyPayUWebhook, async (req, res) => {
 });
 
 // Payment Success Route
-app.post('/payment-success', async (req, res) => {
+app.get('/payment-success', async (req, res) => {
   try {
     const { transactionId } = req.query;
+    console.log('Processing payment success for transaction:', transactionId);
     
     if (!transactionId) {
-      return res.status(400).send('Missing transaction ID');
+      console.error('Missing transaction ID in success callback');
+      return res.redirect(`${process.env.FRONTEND_URL}/payment-failure`);
     }
 
     const firestore = admin.firestore();
@@ -208,12 +241,27 @@ app.post('/payment-success', async (req, res) => {
       .get();
 
     if (transactionSnapshot.empty) {
+      console.error('Transaction not found:', transactionId);
       return res.redirect(`${process.env.FRONTEND_URL}/payment-failure`);
     }
 
-    const transactionData = transactionSnapshot.docs[0].data();
+    const transactionDoc = transactionSnapshot.docs[0];
+    const transactionData = transactionDoc.data();
 
-    // Check for existing order
+    // Check if webhook has already processed this transaction
+    if (transactionData.webhookProcessed) {
+      console.log('Transaction already processed by webhook');
+      const orderSnapshot = await firestore
+        .collection('orders')
+        .where('txnid', '==', transactionId)
+        .get();
+      
+      if (!orderSnapshot.empty) {
+        return res.redirect(`https://www.thefost.com/order-waiting/${orderSnapshot.docs[0].id}`);
+      }
+    }
+
+    // If webhook hasn't processed it yet, handle it here
     const orderSnapshot = await firestore
       .collection('orders')
       .where('txnid', '==', transactionId)
@@ -223,16 +271,15 @@ app.post('/payment-success', async (req, res) => {
 
     if (orderSnapshot.empty) {
       // Create new order
-      const orderRef = await firestore.collection('orders').add({
-        ...transactionData,
-        status: 'pending',
-        paymentStatus: 'completed',
-        confirmedAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-      orderId = orderRef.id;
+      orderId = await createOrder(transactionData, null, 'redirect');
 
-      // Send confirmation email
-      await sendOrderConfirmationEmail(orderId, transactionData);
+      // Update transaction
+      await transactionDoc.ref.update({
+        status: 'completed',
+        paymentStatus: 'success',
+        manuallyProcessed: true,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
     } else {
       orderId = orderSnapshot.docs[0].id;
     }
@@ -249,7 +296,7 @@ app.post('/payment-success', async (req, res) => {
 const sendOrderConfirmationEmail = async (orderId, orderData) => {
   const formattedItems = orderData.items.map(item => 
     `${item.name} x ${item.quantity} - ₹${(item.price * item.quantity).toFixed(2)}`
-  );
+  ).join('\n');
 
   const mailOptions = {
     from: process.env.EMAIL_USER,
@@ -276,9 +323,9 @@ const sendOrderConfirmationEmail = async (orderId, orderData) => {
         <div style="margin-bottom: 20px;">
           <h3 style="color: #4A5568; font-size: 16px;">Items Ordered:</h3>
           <ul style="list-style: none; padding: 0;">
-            ${formattedItems.map(item => `
+            ${orderData.items.map(item => `
               <li style="padding: 10px; background-color: #F7FAFC; margin-bottom: 5px; border-radius: 4px;">
-                ${item}
+                ${item.name} x ${item.quantity} - ₹${(item.price * item.quantity).toFixed(2)}
               </li>
             `).join('')}
           </ul>
@@ -293,7 +340,12 @@ const sendOrderConfirmationEmail = async (orderId, orderData) => {
     `
   };
 
-  await transporter.sendMail(mailOptions);
+  try {
+    await transporter.sendMail(mailOptions);
+    console.log('Order confirmation email sent successfully');
+  } catch (error) {
+    console.error('Error sending order confirmation email:', error);
+  }
 };
 
 const PORT = process.env.PORT || 5058;
