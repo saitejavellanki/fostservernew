@@ -37,6 +37,10 @@ const transporter = nodemailer.createTransport({
   }
 });
 
+// Constants for webhook retry handling
+const WEBHOOK_MAX_RETRIES = 3;
+const WEBHOOK_RETRY_INTERVAL = 5 * 60 * 1000; // 5 minutes in milliseconds
+
 // PayU webhook verification middleware
 const verifyPayUWebhook = (req, res, next) => {
   try {
@@ -159,15 +163,54 @@ app.post('/initiate-payment', async (req, res) => {
   }
 });
 
-// PayU Webhook Handler
-app.post('/payu-webhook', async (req, res) => {
+// PayU Webhook Handler with retry logic
+app.post('/payu-webhook', verifyPayUWebhook, async (req, res) => {
   try {
     console.log('Received PayU webhook:', JSON.stringify(req.body, null, 2));
-    const { txnid, status, amount } = req.body;
+    const { txnid, status, amount, mihpayid } = req.body;
     
     const firestore = admin.firestore();
 
-    // Check for existing order to prevent duplicates
+    // Create a unique webhook ID using transaction ID and mihpayid
+    const webhookId = `${txnid}_${mihpayid}`;
+
+    // Check for existing webhook processing record
+    const webhookRef = firestore.collection('webhook_attempts').doc(webhookId);
+    const webhookDoc = await webhookRef.get();
+
+    if (webhookDoc.exists) {
+      const webhookData = webhookDoc.data();
+      
+      // If webhook was already successfully processed, return success
+      if (webhookData.status === 'success') {
+        console.log('Webhook already successfully processed:', webhookId);
+        return res.status(200).json({ message: 'Webhook already processed' });
+      }
+      
+      // If max retries reached, return error
+      if (webhookData.attempts >= WEBHOOK_MAX_RETRIES) {
+        console.error('Max retry attempts reached for webhook:', webhookId);
+        return res.status(429).json({ error: 'Max retry attempts reached' });
+      }
+      
+      // Update attempt count
+      await webhookRef.update({
+        attempts: admin.firestore.FieldValue.increment(1),
+        lastAttempt: admin.firestore.FieldValue.serverTimestamp()
+      });
+    } else {
+      // Create new webhook attempt record
+      await webhookRef.set({
+        txnid,
+        mihpayid,
+        status: 'pending',
+        attempts: 1,
+        firstAttempt: admin.firestore.FieldValue.serverTimestamp(),
+        lastAttempt: admin.firestore.FieldValue.serverTimestamp()
+      });
+    }
+
+    // Use transaction ID as deduplication key for orders
     const existingOrderSnapshot = await firestore
       .collection('orders')
       .where('txnid', '==', txnid)
@@ -175,11 +218,16 @@ app.post('/payu-webhook', async (req, res) => {
 
     if (!existingOrderSnapshot.empty) {
       console.log('Order already exists for transaction:', txnid);
+      await webhookRef.update({
+        status: 'success',
+        completedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
       return res.status(200).json({ message: 'Order already processed' });
     }
 
-    // Process the webhook
+    // Process the webhook within a transaction for atomicity
     await firestore.runTransaction(async (transaction) => {
+      // Lock the transaction record
       const transactionQuery = await transaction.get(
         firestore.collection('transactions').where('txnid', '==', txnid)
       );
@@ -191,25 +239,51 @@ app.post('/payu-webhook', async (req, res) => {
       const transactionDoc = transactionQuery.docs[0];
       const transactionData = transactionDoc.data();
       
+      // Double-check order doesn't exist within transaction
+      const orderQuery = await transaction.get(
+        firestore.collection('orders').where('txnid', '==', txnid)
+      );
+      
+      if (!orderQuery.empty) {
+        throw new Error('Order already exists');
+      }
+
       if (status.toLowerCase() === 'success') {
         // Create order
-        await createOrder(transactionData, req.body, 'webhook');
+        const orderId = await createOrder(transactionData, req.body, 'webhook');
 
         // Update transaction
-        await transaction.update(transactionDoc.ref, {
+        transaction.update(transactionDoc.ref, {
           status: 'completed',
           paymentStatus: 'success',
           webhookProcessed: true,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          orderId: orderId,
+          mihpayid: mihpayid
+        });
+
+        // Mark webhook as successfully processed
+        transaction.update(webhookRef, {
+          status: 'success',
+          completedAt: admin.firestore.FieldValue.serverTimestamp(),
+          orderId: orderId
         });
       } else {
         // Handle failed payment
-        await transaction.update(transactionDoc.ref, {
+        transaction.update(transactionDoc.ref, {
           status: 'failed',
           paymentStatus: 'failed',
           failureReason: req.body.error_Message || 'Payment failed',
           webhookProcessed: true,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          mihpayid: mihpayid
+        });
+
+        // Mark webhook as completed even for failed payments
+        transaction.update(webhookRef, {
+          status: 'success',
+          completedAt: admin.firestore.FieldValue.serverTimestamp(),
+          paymentStatus: 'failed'
         });
       }
     });
@@ -217,6 +291,13 @@ app.post('/payu-webhook', async (req, res) => {
     res.status(200).json({ message: 'Webhook processed successfully' });
   } catch (error) {
     console.error('Webhook processing error:', error);
+    
+    // If this is a duplicate order error, return success to prevent retries
+    if (error.message === 'Order already exists') {
+      return res.status(200).json({ message: 'Order already processed' });
+    }
+    
+    // For other errors, return 500 to trigger PayU's retry mechanism
     res.status(500).json({ error: 'Webhook processing failed' });
   }
 });
