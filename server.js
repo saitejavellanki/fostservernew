@@ -221,6 +221,81 @@ app.post('/payu-webhook', async (req, res) => {
   }
 });
 
+app.post('/sendnotification', async (req, res) => {
+  try {
+    const { orderId, customerEmail, shopName, customerName, items } = req.body;
+
+    if (!orderId || !customerEmail || !shopName) {
+      return res.status(400).json({
+        error: 'Missing required fields',
+        message: 'orderId, customerEmail, and shopName are required'
+      });
+    }
+
+    const mailOptions = {
+      from: process.env.EMAIL_USER,
+      to: customerEmail,
+      subject: `Your Order #${orderId.slice(-6)} from ${shopName} is Ready!`,
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+          <div style="text-align: center; margin-bottom: 30px;">
+            <h1 style="color: #4A5568;">Order Ready for Pickup</h1>
+          </div>
+          
+          <div style="background-color: #F7FAFC; padding: 20px; border-radius: 8px; margin-bottom: 20px;">
+            <p style="margin: 0;">Hi ${customerName || 'Valued Customer'},</p>
+            <p>Great news! Your order is now ready for pickup at ${shopName}.</p>
+          </div>
+          
+          <div style="margin-bottom: 20px;">
+            <h2 style="color: #4A5568; font-size: 18px;">Order Details:</h2>
+            <p style="margin: 5px 0;">Order Number: #${orderId.slice(-6)}</p>
+            <p style="margin: 5px 0;">Restaurant/Store: ${shopName}</p>
+          </div>
+          
+          ${Array.isArray(items) ? `
+            <div style="margin-bottom: 20px;">
+              <h3 style="color: #4A5568; font-size: 16px;">Items in your order:</h3>
+              <ul style="list-style: none; padding: 0;">
+                ${items.map(item => `
+                  <li style="padding: 10px; background-color: #F7FAFC; margin-bottom: 5px; border-radius: 4px;">
+                    ${item}
+                  </li>
+                `).join('')}
+              </ul>
+            </div>
+          ` : ''}
+          
+          <div style="background-color: #F7FAFC; padding: 15px; border-radius: 8px; margin-bottom: 20px;">
+            <p style="margin: 0; text-align: center; color: #2D3748;">
+              Please show your order QR code when picking up your order.
+            </p>
+          </div>
+
+          <div style="text-align: center; color: #718096; font-size: 14px;">
+            <p>Thank you for choosing ${shopName}!</p>
+          </div>
+        </div>
+      `
+    };
+
+    await transporter.sendMail(mailOptions);
+    console.log('Order ready notification email sent successfully');
+    
+    res.status(200).json({ 
+      success: true, 
+      message: 'Notification email sent successfully' 
+    });
+
+  } catch (error) {
+    console.error('Error sending notification email:', error);
+    res.status(500).json({ 
+      error: 'Failed to send notification email',
+      message: error.message 
+    });
+  }
+});
+
 // Payment Success Route
 app.post('/payment-success', async (req, res) => {
   try {
